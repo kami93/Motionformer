@@ -463,6 +463,9 @@ _C.LOG_MODEL_INFO = False
 # Distributed backend.
 _C.DIST_BACKEND = "nccl"
 
+# Global batch size
+_C.GLOBAL_BATCH_SIZE = 256
+
 # Distributed backend.
 _C.USE_SBATCH = True
 
