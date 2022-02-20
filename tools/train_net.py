@@ -112,7 +112,8 @@ def train_epoch(
                 optimizer.zero_grad()
             
             if (cur_iter + 1) % num_iters != 0:
-                logger.info(f"{cur_iter + 1}/{data_size}. No Synced forward")
+                if cur_iter < num_iters:
+                    logger.info(f"{cur_iter + 1}/{data_size}. No Synced forward")
                 with model.no_sync():
                     with torch.cuda.amp.autocast(enabled=cfg.SOLVER.USE_MIXED_PRECISION):
                         preds = model(inputs)
@@ -125,7 +126,8 @@ def train_epoch(
                         loss.backward()
             
             if (cur_iter + 1) % num_iters == 0:
-                logger.info(f"{cur_iter + 1}/{data_size}. Synced forward")
+                if cur_iter < num_iters:
+                    logger.info(f"{cur_iter + 1}/{data_size}. Synced forward")
                 with torch.cuda.amp.autocast(enabled=cfg.SOLVER.USE_MIXED_PRECISION):
                     preds = model(inputs)
                     loss = loss_fun(preds, labels)
@@ -144,10 +146,10 @@ def train_epoch(
                 with torch.no_grad():
                     for name, param in model.named_parameters():
                         if param.grad is None:
-                            if cur_iter == 0:
+                            if cur_iter < num_iters:
                                 logger.info(f"Skipping a param {name}")
                         else:
-                            if cur_iter == 0:
+                            if cur_iter < num_iters:
                                 logger.info(f"Scaling a param {name} by 1/{num_iters}")
                             param.grad /= num_iters
 
