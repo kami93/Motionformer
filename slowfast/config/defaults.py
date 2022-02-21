@@ -467,7 +467,7 @@ _C.DIST_BACKEND = "nccl"
 _C.GLOBAL_BATCH_SIZE = 256
 
 # Distributed backend.
-_C.USE_SBATCH = True
+_C.USE_SBATCH = False
 
 # ---------------------------------------------------------------------------- #
 # Benchmark options
