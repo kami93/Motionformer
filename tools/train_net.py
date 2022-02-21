@@ -23,7 +23,7 @@ from slowfast.datasets import loader
 from slowfast.models import build_model
 from slowfast.utils.meters import TrainMeter, ValMeter, EPICTrainMeter, EPICValMeter
 from slowfast.utils.multigrid import MultigridSchedule
-from timm.utils import NativeScaler
+# from timm.utils import NativeScaler
 
 logger = logging.get_logger(__name__)
 
@@ -52,7 +52,15 @@ def train_epoch(
     train_meter.iter_tic()
     data_size = len(train_loader)
 
+    cur_global_batch_size = cfg.NUM_SHARDS * cfg.TRAIN.BATCH_SIZE
+    num_iters = cfg.GLOBAL_BATCH_SIZE // cur_global_batch_size
+    
+    if cur_global_batch_size < cfg.GLOBAL_BATCH_SIZE:
+        logger.info("Gradient accumulation enabled!")
+        logger.info(f"cur_global_batch_size: {cur_global_batch_size}, target_global_batch_size: {cfg.GLOBAL_BATCH_SIZE}")
+
     for cur_iter, (inputs, labels, index, meta) in enumerate(train_loader):
+        global_step = data_size * cur_epoch + cur_iter + 1
 
         # Transfer the data to the current GPU device.
         if cfg.NUM_GPUS:
@@ -73,180 +81,134 @@ def train_epoch(
             labels = labels.cuda()
             inputs, labels = mixup_fn(inputs[0], labels)
             inputs = [inputs]
+        else:
+            labels = labels.cuda(non_blocking=True)
 
         # Update the learning rate.
         lr = optim.get_epoch_lr(cur_epoch + float(cur_iter) / data_size, cfg)
         optim.set_lr(optimizer, lr)
 
         train_meter.data_toc()
-
-        with torch.cuda.amp.autocast(enabled=cfg.SOLVER.USE_MIXED_PRECISION):
-            preds = model(inputs)
-            if mixup_fn is None:
-                if isinstance(labels, (dict,)):
-                    labels = {k: v.cuda() for k, v in labels.items()}
-                else:
-                    labels = labels.cuda()
-            global_step = data_size * cur_epoch + cur_iter
-            if isinstance(labels, (dict,)) and cfg.TRAIN.DATASET == "Epickitchens":
-                # Compute the loss.
-                loss_verb = loss_fun(preds[0], labels['verb'])
-                loss_noun = loss_fun(preds[1], labels['noun'])
-                loss = 0.5 * (loss_verb + loss_noun)
-            else:
+        
+        # Perform the backward pass.
+        if cur_global_batch_size >= cfg.GLOBAL_BATCH_SIZE:
+            with torch.cuda.amp.autocast(enabled=cfg.SOLVER.USE_MIXED_PRECISION):
+                preds = model(inputs)
                 loss = loss_fun(preds, labels)
 
-        # check Nan Loss.
-        misc.check_nan_losses(loss)
+            if cfg.SOLVER.USE_MIXED_PRECISION:
+                optimizer.zero_grad()
+                loss_scaler.scale(loss).backward()
+                loss_scaler.step(optimizer)
+                loss_scaler.update()
 
-        # Perform the backward pass.
-        optimizer.zero_grad()
-        if cfg.SOLVER.USE_MIXED_PRECISION: # Mixed Precision Training
-            is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-            loss_scaler(loss, optimizer, clip_grad=cfg.SOLVER.CLIP_GRAD,
-                    parameters=model.parameters(), create_graph=is_second_order)
-        else:
-            loss.backward()
-            # Update the parameters.
-            optimizer.step()
-
-        if cfg.DETECTION.ENABLE:
-            if cfg.NUM_GPUS > 1:
-                loss = du.all_reduce([loss])[0]
-            loss = loss.item()
-
-            # Update and log stats.
-            train_meter.update_stats(None, None, None, loss, lr)
-            # write to tensorboard format if available.
-            if writer is not None:
-                writer.add_scalars(
-                    {"Train/loss": loss, "Train/lr": lr},
-                    global_step=data_size * cur_epoch + cur_iter,
-                )
-
-        else:
-            top1_err, top5_err = None, None
-            if isinstance(labels, (dict,)) and cfg.TRAIN.DATASET == "Epickitchens":
-                # Compute the verb accuracies.
-                verb_top1_acc, verb_top5_acc = metrics.topk_accuracies(
-                    preds[0], labels['verb'], (1, 5))
-
-                # Gather all the predictions across all the devices.
-                if cfg.NUM_GPUS > 1:
-                    loss_verb, verb_top1_acc, verb_top5_acc = du.all_reduce(
-                        [loss_verb, verb_top1_acc, verb_top5_acc]
-                    )
-
-                # Copy the stats from GPU to CPU (sync point).
-                loss_verb, verb_top1_acc, verb_top5_acc = (
-                    loss_verb.item(),
-                    verb_top1_acc.item(),
-                    verb_top5_acc.item(),
-                )
-
-                # Compute the noun accuracies.
-                noun_top1_acc, noun_top5_acc = metrics.topk_accuracies(
-                    preds[1], labels['noun'], (1, 5))
-
-                # Gather all the predictions across all the devices.
-                if cfg.NUM_GPUS > 1:
-                    loss_noun, noun_top1_acc, noun_top5_acc = du.all_reduce(
-                        [loss_noun, noun_top1_acc, noun_top5_acc]
-                    )
-
-                # Copy the stats from GPU to CPU (sync point).
-                loss_noun, noun_top1_acc, noun_top5_acc = (
-                    loss_noun.item(),
-                    noun_top1_acc.item(),
-                    noun_top5_acc.item(),
-                )
-
-                # Compute the action accuracies.
-                action_top1_acc, action_top5_acc = metrics.multitask_topk_accuracies(
-                    (preds[0], preds[1]),
-                    (labels['verb'], labels['noun']),
-                    (1, 5))
-
-                # Gather all the predictions across all the devices.
-                if cfg.NUM_GPUS > 1:
-                    loss, action_top1_acc, action_top5_acc = du.all_reduce(
-                        [loss, action_top1_acc, action_top5_acc]
-                    )
-
-                # Copy the stats from GPU to CPU (sync point).
-                loss, action_top1_acc, action_top5_acc = (
-                    loss.item(),
-                    action_top1_acc.item(),
-                    action_top5_acc.item(),
-                )
-
-                # Update and log stats.
-                train_meter.update_stats(
-                    (verb_top1_acc, noun_top1_acc, action_top1_acc),
-                    (verb_top5_acc, noun_top5_acc, action_top5_acc),
-                    (loss_verb, loss_noun, loss),
-                    lr, inputs[0].size(0) * cfg.NUM_GPUS
-                )
             else:
-                num_topks_correct = metrics.topks_correct(preds, labels, (1, 5))
-                top1_err, top5_err = [
-                    (1.0 - x / preds.size(0)) * 100.0 for x in num_topks_correct
-                ]
-
-                # Gather all the predictions across all the devices.
-                if cfg.NUM_GPUS > 1:
-                    loss, top1_err, top5_err = du.all_reduce(
-                        [loss, top1_err, top5_err]
-                    )
-
-                # Copy the stats from GPU to CPU (sync point).
-                loss, top1_err, top5_err = (
-                    loss.item(),
-                    top1_err.item(),
-                    top5_err.item(),
-                )
-
-                # Update and log stats.
-                train_meter.update_stats(
-                    top1_err,
-                    top5_err,
-                    loss,
-                    lr,
-                    inputs[0].size(0)
-                    * max(
-                        cfg.NUM_GPUS, 1
-                    ),
-                )
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+        
+        else:
+            if cur_iter == 0:
+                optimizer.zero_grad()
             
-            # write to tensorboard format if available.
-            if writer is not None:
-                writer.add_scalars(
-                    {
-                        "Train/loss": loss,
-                        "Train/lr": lr,
-                    },
-                    global_step=data_size * cur_epoch + cur_iter,
-                )
-                if isinstance(labels, (dict,)) and cfg.TRAIN.DATASET == "Epickitchens":
-                    writer.add_scalars(
-                        {
-                            "Train/verb_top1_acc": verb_top1_acc,
-                            "Train/verb_top5_acc": verb_top5_acc,
-                            "Train/noun_top1_acc": noun_top1_acc,
-                            "Train/noun_top5_acc": noun_top5_acc,
-                            "Train/action_top1_acc": action_top1_acc,
-                            "Train/action_top5_acc": action_top5_acc,
-                        },
-                        global_step=data_size * cur_epoch + cur_iter,
-                    )
+            if (cur_iter + 1) % num_iters != 0:
+                if cur_iter < num_iters:
+                    logger.info(f"{cur_iter + 1}/{data_size}. No Synced forward")
+                with model.no_sync():
+                    with torch.cuda.amp.autocast(enabled=cfg.SOLVER.USE_MIXED_PRECISION):
+                        preds = model(inputs)
+                        loss = loss_fun(preds, labels)
+                    # no synchronization, accumulate grads
+                    if cfg.SOLVER.USE_MIXED_PRECISION:
+                        loss_scaler.scale(loss).backward()
+
+                    else:
+                        loss.backward()
+            
+            if (cur_iter + 1) % num_iters == 0:
+                if cur_iter < num_iters:
+                    logger.info(f"{cur_iter + 1}/{data_size}. Synced forward")
+                with torch.cuda.amp.autocast(enabled=cfg.SOLVER.USE_MIXED_PRECISION):
+                    preds = model(inputs)
+                    loss = loss_fun(preds, labels)
+                # synchronize grads
+                if cfg.SOLVER.USE_MIXED_PRECISION:
+                    loss_scaler.scale(loss).backward()
+
                 else:
-                    writer.add_scalars(
-                        {
-                            "Train/Top1_err": top1_err if top1_err is not None else 0.0,
-                            "Train/Top5_err": top5_err if top5_err is not None else 0.0,
-                        },
-                        global_step=data_size * cur_epoch + cur_iter,
-                    )
+                    loss.backward()
+
+                # unscale gradients if mixed precision
+                if cfg.SOLVER.USE_MIXED_PRECISION:
+                    loss_scaler.unscale_(optimizer)
+
+                # scale gradients so that correct lr@GLOBAL_BATCH_SIZE is applied.
+                with torch.no_grad():
+                    for name, param in model.named_parameters():
+                        if param.grad is None:
+                            if cur_iter < num_iters:
+                                logger.info(f"Skipping a param {name}")
+                        else:
+                            if cur_iter < num_iters:
+                                logger.info(f"Scaling a param {name} by 1/{num_iters}")
+                            param.grad /= num_iters
+
+                if cfg.SOLVER.USE_MIXED_PRECISION:
+                    loss_scaler.step(optimizer)
+                    loss_scaler.update()
+                else:
+                    optimizer.step()
+                
+                optimizer.zero_grad()
+
+        top1_err, top5_err = None, None
+            
+        num_topks_correct = metrics.topks_correct(preds, labels, (1, 5))
+        top1_err, top5_err = [
+            (1.0 - x / preds.size(0)) * 100.0 for x in num_topks_correct
+        ]
+
+        # Gather all the predictions across all the devices.
+        if cfg.NUM_GPUS > 1:
+            loss, top1_err, top5_err = du.all_reduce(
+                [loss, top1_err, top5_err]
+            )
+
+        # Copy the stats from GPU to CPU (sync point).
+        loss, top1_err, top5_err = (
+            loss.item(),
+            top1_err.item(),
+            top5_err.item(),
+        )
+
+        # Update and log stats.
+        train_meter.update_stats(
+            top1_err,
+            top5_err,
+            loss,
+            lr,
+            inputs[0].size(0)
+            * max(
+                cfg.NUM_GPUS, 1
+            ),
+        )
+    
+        # write to tensorboard format if available.
+        if writer is not None:
+            writer.add_scalars(
+                {
+                    "Train/loss": loss,
+                    "Train/lr": lr,
+                },
+                global_step=data_size * cur_epoch + cur_iter,
+            )
+            writer.add_scalars(
+                {
+                    "Train/Top1_err": top1_err if top1_err is not None else 0.0,
+                    "Train/Top5_err": top5_err if top5_err is not None else 0.0,
+                },
+                global_step=data_size * cur_epoch + cur_iter,
+            )
 
         train_meter.iter_toc()  # measure allreduce for this meter
         train_meter.log_iter_stats(cur_epoch, cur_iter)
@@ -255,7 +217,6 @@ def train_epoch(
     # Log epoch stats.
     train_meter.log_epoch_stats(cur_epoch)
     train_meter.reset()
-
 
 @torch.no_grad()
 def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writer=None):
@@ -521,7 +482,7 @@ def train(cfg):
 
     # Mixed Precision Training Scaler
     if cfg.SOLVER.USE_MIXED_PRECISION:
-        loss_scaler = NativeScaler()
+        loss_scaler = torch.cuda.amp.GradScaler()
     else:
         loss_scaler = None
 
@@ -531,7 +492,7 @@ def train(cfg):
 
     # Create the video train and val loaders.
     train_loader = loader.construct_loader(cfg, "train")
-    val_loader = loader.construct_loader(cfg, "val")
+    # val_loader = loader.construct_loader(cfg, "val")
     precise_bn_loader = (
         loader.construct_loader(cfg, "train", is_precise_bn=True)
         if cfg.BN.USE_PRECISE_STATS
@@ -541,10 +502,10 @@ def train(cfg):
     # Create meters.
     if cfg.TRAIN.DATASET == 'Epickitchens':
         train_meter = EPICTrainMeter(len(train_loader), cfg)
-        val_meter = EPICValMeter(len(val_loader), cfg)
+        # val_meter = EPICValMeter(len(val_loader), cfg)
     else:
         train_meter = TrainMeter(len(train_loader), cfg)
-        val_meter = ValMeter(len(val_loader), cfg)
+        # val_meter = ValMeter(len(val_loader), cfg)
 
     # set up writer for logging to Tensorboard format.
     if cfg.TENSORBOARD.ENABLE and du.is_master_proc(
@@ -642,8 +603,8 @@ def train(cfg):
             cu.save_checkpoint(cfg.OUTPUT_DIR, model, optimizer, cur_epoch, cfg, 
                 loss_scaler=loss_scaler)
         # Evaluate the model on validation set.
-        if is_eval_epoch:
-            eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writer)
+        # if is_eval_epoch:
+            # eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writer)
 
     if writer is not None:
         writer.close()
