@@ -492,7 +492,7 @@ def train(cfg):
 
     # Create the video train and val loaders.
     train_loader = loader.construct_loader(cfg, "train")
-    # val_loader = loader.construct_loader(cfg, "val")
+    val_loader = loader.construct_loader(cfg, "val")
     precise_bn_loader = (
         loader.construct_loader(cfg, "train", is_precise_bn=True)
         if cfg.BN.USE_PRECISE_STATS
@@ -502,10 +502,10 @@ def train(cfg):
     # Create meters.
     if cfg.TRAIN.DATASET == 'Epickitchens':
         train_meter = EPICTrainMeter(len(train_loader), cfg)
-        # val_meter = EPICValMeter(len(val_loader), cfg)
+        val_meter = EPICValMeter(len(val_loader), cfg)
     else:
         train_meter = TrainMeter(len(train_loader), cfg)
-        # val_meter = ValMeter(len(val_loader), cfg)
+        val_meter = ValMeter(len(val_loader), cfg)
 
     # set up writer for logging to Tensorboard format.
     if cfg.TENSORBOARD.ENABLE and du.is_master_proc(
@@ -603,8 +603,8 @@ def train(cfg):
             cu.save_checkpoint(cfg.OUTPUT_DIR, model, optimizer, cur_epoch, cfg, 
                 loss_scaler=loss_scaler)
         # Evaluate the model on validation set.
-        # if is_eval_epoch:
-            # eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writer)
+        if is_eval_epoch:
+            eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writer)
 
     if writer is not None:
         writer.close()
